@@ -82,6 +82,7 @@ export type {
   MutationNode,
   MutationResult,
   QueryManager,
+  QueryManagerOptions,
   QueryNode,
   QuerySnapshot,
   ToolProvider,

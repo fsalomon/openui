@@ -125,6 +125,43 @@ function AssistantMessage({ response, isStreaming }: { response: string; isStrea
 
 `response` is the raw model output, or a stored message written with `buildMessage`.
 
+### Restore or mirror mutation results
+
+Keep mutation results in host state alongside each message. Supply the saved map through `mutationResults` and use `onMutationResult` to update that host state, persist it, or broadcast local changes:
+
+```tsx
+import { Renderer, type MutationResult } from "@openuidev/react-lang";
+
+function MessageView({
+  message,
+  onMutationResult,
+}: {
+  message: {
+    id: string;
+    response: string;
+    mutationResults: Record<string, MutationResult>;
+  };
+  onMutationResult: (messageId: string, statementId: string, result: MutationResult) => void;
+}) {
+  return (
+    <Renderer
+      key={message.id}
+      response={message.response}
+      library={library}
+      toolProvider={toolProvider}
+      mutationResults={message.mutationResults}
+      onMutationResult={(statementId, result) => onMutationResult(message.id, statementId, result)}
+    />
+  );
+}
+```
+
+Update the host map immutably, merging each callback into its latest state. Feed incoming remote results into that same map. For a program containing `save = Mutation("save_item", {})`, an imported `{ save: { status: "success" } }` makes `save.status` read as `"success"` without calling the tool. Imported results do not trigger `onMutationResult`, so they do not echo back through the callback.
+
+The callback reports local loading, success, and error events. A running local invocation owns the displayed result until it settles; imported loading never prevents retry. Unchanged supplied values do not replay over newer local results during streaming or re-registration. Removing an entry stops supplying it and does not clear retained state; supplying a value equal to the last one for that statement is ignored. Use a new Renderer key for a different message or navigation entry, while keeping it stable during streaming and revisions of that entry.
+
+Payloads must be immutable. Plain objects and arrays compare by value; other objects compare by identity. Hosts handle serialisation and ordering across clients. Observer exceptions are logged without changing mutation outcomes or interrupting subsequent action steps.
+
 ## API Reference
 
 ### Component Definition
@@ -151,6 +188,8 @@ function AssistantMessage({ response, isStreaming }: { response: string; isStrea
 | `onStateUpdate` | `(state: Record<string, any>) => void` | Callback when form fields or `$variables` change |
 | `initialState` | `Record<string, any>` | State to restore, e.g. from a stored message |
 | `toolProvider` | function map or MCP client | Runs `Query()` and `Mutation()` tools |
+| `mutationResults` | `Record<string, MutationResult>` | Restore or mirror mutation results by statement ID without executing tools |
+| `onMutationResult` | `(statementId: string, result: MutationResult) => void` | Observe local loading, success, and error results; imported results never emit this callback |
 | `onError` | `(errors: OpenUIError[]) => void` | Structured errors, `[]` when resolved |
 | `queryLoader` | `React.ReactNode` | Custom loading indicator; defaults to a spinner |
 | `onParseResult` | `(result: ParseResult \| null) => void` | Callback when the parse result changes |
@@ -209,6 +248,7 @@ import type {
   ComponentGroup,
   PromptOptions,
   RendererProps,
+  MutationResult,
   ActionEvent,
   ElementNode,
   ParseResult,

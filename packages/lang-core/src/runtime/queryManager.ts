@@ -50,6 +50,31 @@ export interface MutationResult {
   error?: unknown;
 }
 
+/** Compare immutable mutation payloads: plain objects/arrays by value, other objects by identity. */
+function sameResult(a: MutationResult, b: MutationResult): boolean {
+  const seen = new WeakMap<object, Set<object>>();
+  function equal(a: unknown, b: unknown): boolean {
+    if (Object.is(a, b)) return true;
+    if (!a || !b || typeof a !== "object" || typeof b !== "object") return false;
+    const prototype = Object.getPrototypeOf(a);
+    if (prototype !== Object.getPrototypeOf(b)) return false;
+    if (prototype !== Object.prototype && prototype !== null && !Array.isArray(a)) return false;
+    if (Array.isArray(a) && a.length !== (b as unknown[]).length) return false;
+    if (seen.get(a)?.has(b)) return true;
+    const keys = Reflect.ownKeys(a);
+    if (keys.length !== Reflect.ownKeys(b).length) return false;
+    const pairs = seen.get(a) ?? new Set<object>();
+    pairs.add(b);
+    seen.set(a, pairs);
+    return keys.every(
+      (key) =>
+        Object.prototype.hasOwnProperty.call(b, key) &&
+        equal(Reflect.get(a, key), Reflect.get(b, key)),
+    );
+  }
+  return a.status === b.status && equal(a.data, b.data) && equal(a.error, b.error);
+}
+
 export interface QuerySnapshot extends Record<string, unknown> {
   __openui_loading: string[];
   __openui_refetching: string[];
@@ -69,6 +94,19 @@ export interface QueryManager {
     refreshQueryIds?: string[],
   ): Promise<boolean>;
   getMutationResult(statementId: string): MutationResult | null;
+  /**
+   * Set a mutation's result from outside, e.g. to restore it from persisted state or to mirror a
+   * result produced elsewhere (another tab, a server). Does not call the tool.
+   * - A result for a mutation that is not registered yet (still streaming) is applied on registration;
+   *   the last known result also survives dispose/re-registration.
+   * - A value equal to the last one supplied for the statement is ignored, so re-supplying an unchanged
+   *   map never replays an old result over a newer local one.
+   * - A call running in this manager settles last: an outside result does not release or overwrite it.
+   * - A restored "loading" is display only and never blocks fireMutation.
+   * - Payloads are immutable: plain objects/arrays compare by value, other objects by identity.
+   *   Hosts are responsible for serialising payloads when persisting or transporting them.
+   */
+  setMutationResult(statementId: string, result: MutationResult): void;
   subscribe(listener: () => void): () => void;
   getSnapshot(): QuerySnapshot;
   activate(): void;
@@ -92,9 +130,16 @@ interface QueryEntry {
 }
 
 interface MutationEntry {
-  toolName: string;
+  /** Null until a result supplied during streaming is registered. Retained across detachments. */
+  toolName: string | null;
+  registered: boolean;
+  /** Last external or settled local result. A local loading state is a transient overlay. */
   result: MutationResult;
+  /** Last value passed to setMutationResult; an equal value is ignored. */
+  supplied: MutationResult | null;
   error?: OpenUIError;
+  /** Identity token invalidated on removal, tool change, or disposal. */
+  inFlight: { result: MutationResult } | null;
 }
 
 interface CacheEntry {
@@ -134,8 +179,50 @@ function buildCacheKey(toolName: string, args: unknown, deps: unknown): string {
 
 // ── Factory ──────────────────────────────────────────────────────────────────
 
-export function createQueryManager(toolProvider: ToolProvider | null): QueryManager {
+export interface QueryManagerOptions {
+  /** Reports local loading/success/error, never imported results. Observer exceptions are logged. */
+  onMutationResult?: (statementId: string, result: MutationResult) => void;
+}
+
+function importedError(statementId: string, toolName: string, error: unknown): OpenUIError {
+  let message: string;
+  if (error instanceof Error) message = error.message;
+  else if (typeof error === "string") message = error;
+  else {
+    try {
+      message = JSON.stringify(error ?? null) ?? String(error);
+    } catch {
+      try {
+        message = String(error);
+      } catch {
+        message = "Unknown error";
+      }
+    }
+  }
+  return {
+    source: "mutation",
+    code: "tool-error",
+    message: `Mutation "${toolName}" failed: ${message}`,
+    statementId,
+    component: "Mutation",
+    toolName,
+  };
+}
+
+export function createQueryManager(
+  toolProvider: ToolProvider | null,
+  options: QueryManagerOptions = {},
+): QueryManager {
+  const report = (statementId: string, result: MutationResult) => {
+    try {
+      options.onMutationResult?.(statementId, result);
+    } catch (err) {
+      // An observer (e.g. persistence) must never change the mutation's outcome.
+      console.error("[openui] onMutationResult threw", err);
+    }
+  };
   const queries = new Map<string, QueryEntry>();
+  // One retained entry owns registration, the restorable result, and any local invocation.
   const mutations = new Map<string, MutationEntry>();
   const cache = new Map<string, CacheEntry>();
   const listeners = new Set<() => void>();
@@ -147,7 +234,6 @@ export function createQueryManager(toolProvider: ToolProvider | null): QueryMana
   };
   let snapshotJson = JSON.stringify(snapshot);
   let disposed = false;
-  let generation = 0;
 
   // ── Snapshot & notification ──────────────────────────────────────────────
 
@@ -181,8 +267,9 @@ export function createQueryManager(toolProvider: ToolProvider | null): QueryMana
     }
 
     for (const [sid, m] of mutations) {
-      out[sid] = m.result;
-      if (m.error) out.__openui_errors.push(m.error);
+      if (!m.registered) continue;
+      out[sid] = m.inFlight?.result ?? m.result;
+      if (!m.inFlight && m.error) out.__openui_errors.push(m.error);
     }
 
     try {
@@ -440,32 +527,43 @@ export function createQueryManager(toolProvider: ToolProvider | null): QueryMana
 
   // ── Mutation methods ─────────────────────────────────────────────────────
 
+  function publishMutations(localEvent?: { statementId: string; result: MutationResult }) {
+    const changed = rebuildSnapshot();
+    // Capture the event before observers/subscribers can re-enter and change the displayed result.
+    if (localEvent) report(localEvent.statementId, localEvent.result);
+    if (changed) notify();
+  }
+
+  function createMutationEntry(result: MutationResult = { status: "idle" }): MutationEntry {
+    return { toolName: null, registered: false, result, supplied: null, inFlight: null };
+  }
+
   function registerMutations(nodes: MutationNode[]) {
+    if (disposed) return;
     const activeIds = new Set(nodes.map((n) => n.statementId));
 
-    // Clean up removed mutations
-    for (const sid of mutations.keys()) {
-      if (!activeIds.has(sid)) mutations.delete(sid);
+    for (const [sid, m] of mutations) {
+      if (!activeIds.has(sid)) {
+        m.registered = false;
+        m.inFlight = null;
+      }
     }
 
     // Register/update active mutations
     for (const node of nodes) {
-      const existing = mutations.get(node.statementId);
-      if (existing) {
-        if (existing.toolName !== node.toolName) {
-          existing.toolName = node.toolName;
-          existing.result = { status: "idle", data: null, error: null };
-          existing.error = undefined;
-        }
-      } else {
-        mutations.set(node.statementId, {
-          toolName: node.toolName,
-          result: { status: "idle" },
-        });
+      let m = mutations.get(node.statementId);
+      if (!m || (m.toolName !== null && m.toolName !== node.toolName)) {
+        // Retain tool identity across removal/disposal so results never move to another tool.
+        m = createMutationEntry();
+        mutations.set(node.statementId, m);
       }
+      if (m.toolName === null && m.result.status === "error")
+        m.error = importedError(node.statementId, node.toolName, m.result.error);
+      m.toolName = node.toolName;
+      m.registered = true;
     }
 
-    if (rebuildSnapshot()) notify();
+    publishMutations();
   }
 
   async function fireMutation(
@@ -475,36 +573,43 @@ export function createQueryManager(toolProvider: ToolProvider | null): QueryMana
   ): Promise<boolean> {
     if (disposed || !toolProvider) return false;
     const m = mutations.get(statementId);
-    if (!m) return false;
+    if (!m?.registered || m.toolName === null) return false;
 
-    // Reject concurrent calls on the same mutation — prevents double-submit
-    if (m.result.status === "loading") return false;
+    // Reject concurrent calls on the same mutation — prevents double-submit. Only a call running in this
+    // manager counts: a displayed "loading" restored from outside must not lock the mutation.
+    if (m.inFlight !== null) return false;
 
-    const gen = generation;
+    const toolName = m.toolName;
+    const invocation = { result: { status: "loading" } as MutationResult };
+    const isCurrent = () =>
+      !disposed && m.registered && mutations.get(statementId) === m && m.inFlight === invocation;
+    m.inFlight = invocation;
 
-    m.result = { status: "loading" };
-    rebuildSnapshot();
-    notify();
+    publishMutations({ statementId, result: invocation.result });
+    // A loading observer may have disposed the manager or changed the registered tool.
+    if (!isCurrent()) return false;
 
     let success = false;
     try {
-      const data = await toolProvider.callTool(m.toolName, evaluatedArgs);
-      if (disposed || gen !== generation) return false;
+      const data = await toolProvider.callTool(toolName, evaluatedArgs);
+      if (!isCurrent()) return false;
+      m.inFlight = null;
       m.result = { status: "success", data };
       m.error = undefined;
       success = true;
     } catch (err) {
-      if (disposed || gen !== generation) return false;
+      if (!isCurrent()) return false;
+      m.inFlight = null;
       const msg = err instanceof Error ? err.message : String(err);
       m.result = { status: "error", error: msg };
       if (err instanceof ToolNotFoundError) {
         m.error = {
           source: "mutation",
           code: "tool-not-found",
-          message: `Mutation tool "${m.toolName}" not found`,
+          message: `Mutation tool "${toolName}" not found`,
           statementId,
           component: "Mutation",
-          toolName: m.toolName,
+          toolName,
           hint: err.availableTools.length
             ? `Available tools: ${err.availableTools.join(", ")}`
             : undefined,
@@ -513,25 +618,24 @@ export function createQueryManager(toolProvider: ToolProvider | null): QueryMana
         m.error = {
           source: "mutation",
           code: "mcp-error",
-          message: `Mutation "${m.toolName}" returned an error: ${err.toolErrorText}`,
+          message: `Mutation "${toolName}" returned an error: ${err.toolErrorText}`,
           statementId,
           component: "Mutation",
-          toolName: m.toolName,
+          toolName,
         };
       } else {
         m.error = {
           source: "mutation",
           code: "tool-error",
-          message: `Mutation "${m.toolName}" failed: ${msg}`,
+          message: `Mutation "${toolName}" failed: ${msg}`,
           statementId,
           component: "Mutation",
-          toolName: m.toolName,
+          toolName,
         };
       }
     }
 
-    rebuildSnapshot();
-    notify();
+    publishMutations({ statementId, result: m.result });
 
     if (success && refreshQueryIds?.length) {
       invalidate(refreshQueryIds);
@@ -541,7 +645,28 @@ export function createQueryManager(toolProvider: ToolProvider | null): QueryMana
   }
 
   function getMutationResult(statementId: string): MutationResult | null {
-    return mutations.get(statementId)?.result ?? null;
+    const m = mutations.get(statementId);
+    return m?.registered ? (m.inFlight?.result ?? m.result) : null;
+  }
+
+  function setMutationResult(statementId: string, result: MutationResult) {
+    if (disposed) return;
+    let m = mutations.get(statementId);
+    if (m?.supplied && sameResult(m.supplied, result)) return;
+    const supplied = { ...result };
+    if (!m) {
+      m = createMutationEntry(supplied);
+      mutations.set(statementId, m);
+    } else {
+      m.result = supplied;
+    }
+    m.supplied = supplied;
+    m.error =
+      result.status === "error" && m.toolName !== null
+        ? importedError(statementId, m.toolName, result.error)
+        : undefined;
+    // While a local call owns the display, retain this value only as its detachment fallback.
+    if (m.registered) publishMutations();
   }
 
   // ── Pub/sub ──────────────────────────────────────────────────────────────
@@ -563,7 +688,6 @@ export function createQueryManager(toolProvider: ToolProvider | null): QueryMana
 
   function dispose() {
     disposed = true;
-    generation++;
     listeners.clear();
     // Clear timers and transient state, preserve cache + query entries for Strict Mode re-attach
     for (const q of queries.values()) {
@@ -575,7 +699,11 @@ export function createQueryManager(toolProvider: ToolProvider | null): QueryMana
       q.loading = false;
       q.needsRefetch = false;
     }
-    mutations.clear();
+    for (const m of mutations.values()) {
+      m.registered = false;
+      m.inFlight = null;
+    }
+    rebuildSnapshot();
   }
 
   return {
@@ -587,6 +715,7 @@ export function createQueryManager(toolProvider: ToolProvider | null): QueryMana
     registerMutations,
     fireMutation,
     getMutationResult,
+    setMutationResult,
     subscribe,
     getSnapshot,
     activate,

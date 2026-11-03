@@ -3,6 +3,7 @@ import type {
   ElementNode,
   LibraryActionEvent,
   McpClientLike,
+  MutationResult,
   OpenUIError,
   ParseResult,
   ToolProvider,
@@ -59,6 +60,20 @@ export interface RendererProps<L extends Library = Library> {
    */
   toolProvider?:
     Record<string, (args: Record<string, unknown>) => Promise<unknown>> | McpClientLike | null;
+  /**
+   * Mutation results to restore or mirror, by statement ID, e.g. `{ save: { status: "success" } }`.
+   * Use it like initialState: persist results with a message, or mirror a result that another client
+   * (or a server) produced, so `save.status` reads the same everywhere. The tool is not called.
+   * Supplied values apply when they change; unchanged values do not replay over newer local results.
+   * A running local call owns its displayed result until it settles. Restored loading is display only
+   * and does not prevent a retry. Results belong to statement IDs in this program; use a new Renderer
+   * key for a different program. Removing an entry stops supplying it; it does not clear its result,
+   * and supplying a value equal to the last one for that statement is ignored.
+   * Payloads must be immutable. Hosts handle serialisation for persistence/transport.
+   */
+  mutationResults?: Record<string, MutationResult>;
+  /** Reports local loading/success/error, never imported results. Observer exceptions are logged. */
+  onMutationResult?: (statementId: string, result: MutationResult) => void;
   /** Custom loading indicator. Defaults to a spinner. */
   queryLoader?: React.ReactNode;
   /** Custom slot composition. Omit to keep content visible with a loading indicator. */
@@ -200,6 +215,8 @@ function RendererRoot<L extends Library = Library>({
   initialState,
   onParseResult,
   toolProvider,
+  mutationResults,
+  onMutationResult,
   queryLoader,
   children,
   onError,
@@ -247,6 +264,8 @@ function RendererRoot<L extends Library = Library>({
         onStateUpdate,
         initialState,
         toolProvider: resolvedToolProvider,
+        mutationResults,
+        onMutationResult,
         onError,
         publishObservability,
       },

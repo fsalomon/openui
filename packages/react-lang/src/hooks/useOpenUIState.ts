@@ -10,6 +10,7 @@ import {
   type ActionPlan,
   type EvalContext,
   type EvaluationContext,
+  type MutationResult,
   type OpenUIError,
   type ParseResult,
   type QueryManager,
@@ -48,6 +49,15 @@ export interface UseOpenUIStateOptions {
   initialState?: Record<string, any>;
   /** ToolProvider for Query data fetching — MCP, REST, GraphQL, or any backend. */
   toolProvider?: ToolProvider | null;
+  /**
+   * Mutation results to restore or mirror, by statement ID (e.g. persisted with a message, or
+   * produced in another client). Immutable values apply when they change; the tool is not called.
+   * Local calls own the display until they settle; restored loading never prevents retry.
+   * Removing a supplied entry does not clear its result. Use a new Renderer key for a new program.
+   */
+  mutationResults?: Record<string, MutationResult>;
+  /** Called whenever a mutation fired in this renderer changes its result (loading, success, error). */
+  onMutationResult?: (statementId: string, result: MutationResult) => void;
   /** Callback for structured, LLM-friendly errors. See OpenUIError type. */
   onError?: (errors: OpenUIError[]) => void;
   publishObservability?: boolean;
@@ -82,6 +92,8 @@ export function useOpenUIState(
     onStateUpdate,
     initialState,
     toolProvider,
+    mutationResults,
+    onMutationResult,
     onError,
     publishObservability,
   }: UseOpenUIStateOptions,
@@ -144,8 +156,13 @@ export function useOpenUIState(
   const store = useMemo<Store>(() => createStore(), []);
 
   // ─── QueryManager ───
+  const onMutationResultRef = useRef(onMutationResult);
+  onMutationResultRef.current = onMutationResult;
   const queryManager = useMemo<QueryManager>(
-    () => createQueryManager(toolProvider ?? null),
+    () =>
+      createQueryManager(toolProvider ?? null, {
+        onMutationResult: (id, r) => onMutationResultRef.current?.(id, r),
+      }),
     [toolProvider],
   );
 
@@ -257,6 +274,15 @@ export function useOpenUIState(
     // Always call — empty array clears removed mutations and their errors
     queryManager.registerMutations(nodes);
   }, [blocked, result?.mutationStatements, evaluationContext, queryManager]);
+
+  // ─── Restore / mirror mutation results ───
+  // The QueryManager ignores a value equal to the last one supplied for a statement, so an unchanged
+  // map never replays an old result over newer local state (e.g. while a call is pending and the
+  // response re-parses), and it keeps the last known result for registration and remounts.
+  useEffect(() => {
+    for (const [id, r] of Object.entries(mutationResults ?? {}))
+      queryManager.setMutationResult(id, r);
+  }, [mutationResults, queryManager]);
 
   // ─── Ref for stable callbacks ───
   const propsRef = useRef({ onAction, onStateUpdate });

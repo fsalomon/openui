@@ -120,6 +120,31 @@ const merged = mergeStatements(original, patch);
 // header and tbl kept from original, root replaced, chart added
 ```
 
+### Restore or mirror mutation results
+
+Hosts can keep mutation results with a message and restore them after a reload, or mirror results from another client:
+
+```ts
+import { createQueryManager, type MutationResult } from "@openuidev/lang-core";
+
+const results: Record<string, MutationResult> = {};
+const manager = createQueryManager(toolProvider, {
+  onMutationResult(statementId, result) {
+    results[statementId] = result;
+    // Persist or broadcast results from this manager in your application.
+  },
+});
+
+// This does not execute save_item or call onMutationResult.
+manager.setMutationResult("save", { status: "success", data: { id: "item-1" } });
+manager.registerMutations([{ statementId: "save", toolName: "save_item" }]);
+// The program can now read save.status as "success".
+```
+
+Results supplied before registration are retained, and a value equal to the last one supplied for a statement is ignored. Re-registering the same statement/tool or disposing and activating the manager preserves its restorable result; changing the tool resets it. A local invocation owns the displayed loading state until it settles, and external updates cannot release its submission guard. Restored loading is display only and permits retry. Completions from removed, replaced, or disposed invocations are ignored.
+
+`onMutationResult` reports local loading, success, and error events. Imported results never echo through it, and observer exceptions are logged without changing the tool outcome. Treat payloads as immutable: plain objects and arrays compare by value, while other objects compare by identity. Hosts handle serialisation and ordering when transporting results between clients. Use a separate manager for each message or program lifetime.
+
 ## API
 
 ### Parser
@@ -179,7 +204,7 @@ sending it.
 
 | Export | Description |
 | :--- | :--- |
-| `createQueryManager(toolProvider)` | Manages Query/Mutation execution and caching |
+| `createQueryManager(toolProvider, options?)` | Manages Query/Mutation execution and caching; `options.onMutationResult` observes local mutation results |
 | `createStore()` | Reactive store for `$variables` and form state |
 | `evaluate(ast, context)` | Evaluate an AST node to a concrete value |
 | `evaluateElementProps(root, context)` | Recursively evaluate all props in an element tree |
@@ -198,6 +223,8 @@ import type {
   ToolProvider,
   McpClientLike,
   QueryManager,
+  QueryManagerOptions,
+  MutationResult,
   Store,
   OpenUIError,
 } from "@openuidev/lang-core";

@@ -75,6 +75,7 @@ export { ToolNotFoundError, extractToolResult, isReactiveAssign } from "@openuid
 export type {
   EvaluationContext,
   McpClientLike,
+  MutationResult,
   ReactiveAssign,
   StateField,
   ToolProvider,
